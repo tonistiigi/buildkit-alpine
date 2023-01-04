@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	apko "chainguard.dev/apko/pkg/build/types"
@@ -57,6 +58,10 @@ func parsePlatforms(v string) ([]ocispecs.Platform, error) {
 	return pl, nil
 }
 
+type cf interface {
+	CurrentFrontend() (*llb.State, error)
+}
+
 func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	opts := c.BuildOpts()
 
@@ -75,6 +80,17 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	}
 	if len(pl) == 0 {
 		pl = append(pl, platforms.Normalize(platforms.DefaultSpec()))
+	}
+
+	var self llb.State
+	if cc, ok := c.(cf); !ok {
+		return nil, errors.Errorf("no support for frontend reexec, buildkit v0.10+ required")
+	} else {
+		st, err := cc.CurrentFrontend()
+		if err != nil {
+			return nil, err
+		}
+		self = *st
 	}
 
 	// TODO: git/http contexts
@@ -111,7 +127,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	for k, p := range pl {
 		k, p := k, p
 		eg.Go(func() error {
-			r, err := buildPlatform(ctx, c, p, ic)
+			r, err := buildPlatform(ctx, c, self, p, ic)
 			if err != nil {
 				return err
 			}
@@ -144,22 +160,51 @@ func isIgnoreCache(c client.Client) bool {
 	return false
 }
 
-func buildPlatform(ctx context.Context, c client.Client, p ocispecs.Platform, ic *apko.ImageConfiguration) (*client.Result, error) {
+func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocispecs.Platform, ic *apko.ImageConfiguration) (*client.Result, error) {
 	cmd := fmt.Sprintf(`sh -c "apk add --initdb --arch %s --root /out"`, alpinePlatform(p))
 
 	ro := []llb.RunOption{llb.Shlex(cmd), llb.Network(llb.NetModeNone)}
 	if isIgnoreCache(c) {
 		ro = append(ro, llb.IgnoreCache)
 	}
-	st := llb.Image("alpine").Run(ro...)
-	def, err := st.Marshal(ctx)
+	rootfs := self.Run(ro...).AddMount("/out", llb.Scratch())
+
+	rootfs = rootfs.File(
+		llb.Mkfile("/etc/apk/repositories", 0644, []byte(strings.Join(ic.Contents.Repositories, "\n"))).
+			Copy(self, "/usr/share/apk/keys/"+alpinePlatform(p)+"/*", "/etc/apk/keys/", &llb.CopyInfo{
+				AllowWildcard:      true,
+				AllowEmptyWildcard: true,
+				FollowSymlinks:     true,
+			}),
+	)
+
+	cmd = fmt.Sprintf(`sh -c "ls -l /out/etc/apk/keys && apk update --root /out && apk fetch -R --simulate --root /out --update --url %s > /urls"`, strings.Join(ic.Contents.Packages, " "))
+
+	ro = []llb.RunOption{llb.Shlex(cmd)}
+	if isIgnoreCache(c) {
+		ro = append(ro, llb.IgnoreCache)
+	}
+	run := self.Run(ro...)
+	run.AddMount("/out", rootfs)
+
+	def, err := run.Marshal(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	return c.Solve(ctx, client.SolveRequest{
+	res, err := c.Solve(ctx, client.SolveRequest{
 		Definition: def.ToPB(),
 	})
+	if err != nil {
+		return nil, err
+	}
+	dt, err := res.Ref.ReadFile(ctx, client.ReadRequest{
+		Filename: "/urls",
+	})
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("urls: %s", string(dt))
+	return res, nil
 }
 
 func parse(dt []byte) (*apko.ImageConfiguration, error) {

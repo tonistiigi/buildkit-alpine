@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
+	"path"
 	"strings"
 
 	apko "chainguard.dev/apko/pkg/build/types"
@@ -93,6 +95,13 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 		self = *st
 	}
 
+	if opts.Opts["build-arg:urls"] != "" {
+		if len(pl) != 1 {
+			return nil, errors.Errorf("multiple platforms not supported with urls")
+		}
+		return installPkgs(ctx, c, self, pl[0])
+	}
+
 	// TODO: git/http contexts
 	src := llb.Local(localContextName, llb.SessionID(c.BuildOpts().SessionID), llb.SharedKeyHint("alpine-filename"), llb.FollowPaths([]string{fn}))
 	def, err := src.Marshal(ctx)
@@ -160,7 +169,7 @@ func isIgnoreCache(c client.Client) bool {
 	return false
 }
 
-func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocispecs.Platform, ic *apko.ImageConfiguration) (*client.Result, error) {
+func initRepo(c client.Client, self llb.State, p ocispecs.Platform, repos []string) llb.State {
 	cmd := fmt.Sprintf(`sh -c "apk add --initdb --arch %s --root /out"`, alpinePlatform(p))
 
 	ro := []llb.RunOption{llb.Shlex(cmd), llb.Network(llb.NetModeNone)}
@@ -170,17 +179,22 @@ func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocisp
 	rootfs := self.Run(ro...).AddMount("/out", llb.Scratch())
 
 	rootfs = rootfs.File(
-		llb.Mkfile("/etc/apk/repositories", 0644, []byte(strings.Join(ic.Contents.Repositories, "\n"))).
+		llb.Mkfile("/etc/apk/repositories", 0644, []byte(strings.Join(repos, "\n"))).
 			Copy(self, "/usr/share/apk/keys/"+alpinePlatform(p)+"/*", "/etc/apk/keys/", &llb.CopyInfo{
 				AllowWildcard:      true,
 				AllowEmptyWildcard: true,
 				FollowSymlinks:     true,
 			}),
 	)
+	return rootfs
+}
 
-	cmd = fmt.Sprintf(`sh -c "ls -l /out/etc/apk/keys && apk update --root /out && apk fetch -R --simulate --root /out --update --url %s > /urls"`, strings.Join(ic.Contents.Packages, " "))
+func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocispecs.Platform, ic *apko.ImageConfiguration) (*client.Result, error) {
+	rootfs := initRepo(c, self, p, ic.Contents.Repositories)
 
-	ro = []llb.RunOption{llb.Shlex(cmd)}
+	cmd := fmt.Sprintf(`sh -c "ls -l /out/etc/apk/keys && apk update --root /out && apk fetch -R --simulate --root /out --update --url %s > /urls"`, strings.Join(ic.Contents.Packages, " "))
+
+	ro := []llb.RunOption{llb.Shlex(cmd)}
 	if isIgnoreCache(c) {
 		ro = append(ro, llb.IgnoreCache)
 	}
@@ -204,7 +218,64 @@ func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocisp
 		return nil, err
 	}
 	log.Printf("urls: %s", string(dt))
-	return res, nil
+
+	var urls []string
+	for _, u := range strings.Split(string(dt), "\n") {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		urls = append(urls, u)
+	}
+
+	opts := map[string]string{}
+	for k, v := range c.BuildOpts().Opts {
+		opts[k] = v
+	}
+
+	opts["platform"] = platforms.Format(p)
+	opts["build-arg:urls"] = strings.Join(urls, ",")
+	opts["build-arg:repositories"] = strings.Join(ic.Contents.Repositories, ",")
+
+	return c.Solve(ctx, client.SolveRequest{
+		Frontend:    "gateway.v0",
+		FrontendOpt: opts,
+		// FrontendInputs
+	})
+}
+
+func installPkgs(ctx context.Context, c client.Client, self llb.State, p ocispecs.Platform) (*client.Result, error) {
+	urls := c.BuildOpts().Opts["build-arg:urls"]
+	repos := c.BuildOpts().Opts["build-arg:repositories"]
+
+	rootfs := initRepo(c, self, p, strings.Split(repos, ","))
+
+	cmd := `sh -c "apk add --no-network --root /out /downloads/*.apk"`
+
+	ro := []llb.RunOption{llb.Shlex(cmd), llb.Network(llb.NetModeNone)}
+	if isIgnoreCache(c) {
+		ro = append(ro, llb.IgnoreCache)
+	}
+	run := self.Run(ro...)
+	rootfs = run.AddMount("/out", rootfs)
+
+	for _, rawURL := range strings.Split(urls, ",") {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, err
+		}
+		base := path.Base(u.Path)
+		run.AddMount("/downloads/"+base, llb.HTTP(rawURL, llb.Filename(base)), llb.SourcePath(base))
+	}
+
+	def, err := rootfs.Marshal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	res, err := c.Solve(ctx, client.SolveRequest{
+		Definition: def.ToPB(),
+	})
+	return res, err
 }
 
 func parse(dt []byte) (*apko.ImageConfiguration, error) {

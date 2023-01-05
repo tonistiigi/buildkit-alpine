@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"path"
 	"strings"
@@ -146,6 +145,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 				ID:       pkey,
 				Platform: p,
 			}
+			res.AddMeta(exptypes.ExporterImageConfigKey+"/"+pkey, r.Metadata[exptypes.ExporterImageConfigKey])
 			return nil
 		})
 	}
@@ -172,7 +172,7 @@ func isIgnoreCache(c client.Client) bool {
 func initRepo(c client.Client, self llb.State, p ocispecs.Platform, repos []string) llb.State {
 	cmd := fmt.Sprintf(`sh -c "apk add --initdb --arch %s --root /out"`, alpinePlatform(p))
 
-	ro := []llb.RunOption{llb.Shlex(cmd), llb.Network(llb.NetModeNone)}
+	ro := []llb.RunOption{llb.Shlex(cmd), llb.Network(llb.NetModeNone), llb.WithCustomNamef("[%s] initialize repo %s", platforms.Format(p))}
 	if isIgnoreCache(c) {
 		ro = append(ro, llb.IgnoreCache)
 	}
@@ -185,6 +185,7 @@ func initRepo(c client.Client, self llb.State, p ocispecs.Platform, repos []stri
 				AllowEmptyWildcard: true,
 				FollowSymlinks:     true,
 			}),
+		llb.WithCustomNamef("[%s] add repositories and keys", platforms.Format(p)),
 	)
 	return rootfs
 }
@@ -194,7 +195,7 @@ func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocisp
 
 	cmd := fmt.Sprintf(`sh -c "ls -l /out/etc/apk/keys && apk update --root /out && apk fetch -R --simulate --root /out --update --url %s > /urls"`, strings.Join(ic.Contents.Packages, " "))
 
-	ro := []llb.RunOption{llb.Shlex(cmd)}
+	ro := []llb.RunOption{llb.Shlex(cmd), llb.WithCustomNamef("[%s] fetch package locations", platforms.Format(p))}
 	if isIgnoreCache(c) {
 		ro = append(ro, llb.IgnoreCache)
 	}
@@ -217,7 +218,6 @@ func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocisp
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("urls: %s", string(dt))
 
 	var urls []string
 	for _, u := range strings.Split(string(dt), "\n") {
@@ -237,6 +237,13 @@ func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocisp
 	opts["build-arg:urls"] = strings.Join(urls, ",")
 	opts["build-arg:repositories"] = strings.Join(ic.Contents.Repositories, ",")
 
+	opts["build-arg:cmd"] = ic.Cmd
+	opts["build-arg:entrypoint"] = ic.Entrypoint.Command // TODO
+	opts["build-arg:workdir"] = ic.WorkDir
+	for k, v := range ic.Environment {
+		opts["build-arg:env:"+k] = v
+	}
+
 	return c.Solve(ctx, client.SolveRequest{
 		Frontend:    "gateway.v0",
 		FrontendOpt: opts,
@@ -252,7 +259,7 @@ func installPkgs(ctx context.Context, c client.Client, self llb.State, p ocispec
 
 	cmd := `sh -c "apk add --no-network --root /out /downloads/*.apk"`
 
-	ro := []llb.RunOption{llb.Shlex(cmd), llb.Network(llb.NetModeNone)}
+	ro := []llb.RunOption{llb.Shlex(cmd), llb.Network(llb.NetModeNone), llb.WithCustomNamef("[%s] install packages", platforms.Format(p))}
 	if isIgnoreCache(c) {
 		ro = append(ro, llb.IgnoreCache)
 	}
@@ -265,7 +272,7 @@ func installPkgs(ctx context.Context, c client.Client, self llb.State, p ocispec
 			return nil, err
 		}
 		base := path.Base(u.Path)
-		run.AddMount("/downloads/"+base, llb.HTTP(rawURL, llb.Filename(base)), llb.SourcePath(base))
+		run.AddMount("/downloads/"+base, llb.HTTP(rawURL, llb.Filename(base), llb.WithCustomNamef("[%s] download %s", platforms.Format(p), base)), llb.SourcePath(base))
 	}
 
 	def, err := rootfs.Marshal(ctx)
@@ -275,7 +282,40 @@ func installPkgs(ctx context.Context, c client.Client, self llb.State, p ocispec
 	res, err := c.Solve(ctx, client.SolveRequest{
 		Definition: def.ToPB(),
 	})
-	return res, err
+	if err != nil {
+		return nil, err
+	}
+
+	img := ocispecs.Image{
+		Architecture: p.Architecture,
+		OS:           p.OS,
+		Variant:      p.Variant,
+	}
+	for k, v := range c.BuildOpts().Opts {
+		if !strings.HasPrefix(k, "build-arg:") {
+			continue
+		}
+		if k == "build-arg:cmd" && v != "" {
+			img.Config.Cmd = strings.Split(v, " ")
+		}
+		if k == "build-arg:entrypoint" && v != "" {
+			img.Config.Entrypoint = strings.Split(v, " ")
+		}
+		if k == "build-arg:workdir" && v != "" {
+			img.Config.WorkingDir = v
+		}
+		if strings.HasPrefix(k, "build-arg:env:") {
+			img.Config.Env = append(img.Config.Env, strings.TrimPrefix(k, "build-arg:env:")+"="+v)
+		}
+	}
+	dt, err := json.Marshal(img)
+	if err != nil {
+		return nil, err
+	}
+
+	res.AddMeta(exptypes.ExporterImageConfigKey, dt)
+
+	return res, nil
 }
 
 func parse(dt []byte) (*apko.ImageConfiguration, error) {

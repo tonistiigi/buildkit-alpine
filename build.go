@@ -21,21 +21,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var platformMapping = map[string]string{
-	"amd64": "x86_64",
-	"arm64": "aarch64",
-	"386":   "x86",
-	"arm":   "armv7l",
-}
-
-func alpinePlatform(p ocispecs.Platform) string {
-	v, ok := platformMapping[p.Architecture]
-	if !ok {
-		return p.Architecture
-	}
-	return v
-}
-
 type cf interface {
 	CurrentFrontend() (*llb.State, error)
 }
@@ -81,6 +66,10 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	ic, err := parse(src.Data)
 	if err != nil {
 		return nil, err
+	}
+
+	if ui.TargetPlatforms == nil && len(ic.Archs) > 0 {
+		ui.TargetPlatforms = fromAlpinePlatforms(ic.Archs)
 	}
 
 	rb, err := ui.Build(ctx, func(ctx context.Context, platform *ocispecs.Platform, idx int) (client.Reference, *image.Image, error) {

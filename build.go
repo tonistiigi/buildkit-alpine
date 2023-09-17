@@ -24,7 +24,7 @@ const (
 
 	keyFilename      = "filename"
 	keyPlatform      = "platform"
-	localContextName = "context"
+	localContextName = "dockerfile"
 )
 
 var platformMapping = map[string]string{

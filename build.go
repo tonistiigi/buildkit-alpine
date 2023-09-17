@@ -12,20 +12,13 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
+	"github.com/moby/buildkit/exporter/containerimage/image"
+	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
-)
-
-const (
-	defaultFilename = "Dockerfile"
-
-	keyFilename      = "filename"
-	keyPlatform      = "platform"
-	localContextName = "dockerfile"
 )
 
 var platformMapping = map[string]string{
@@ -43,45 +36,30 @@ func alpinePlatform(p ocispecs.Platform) string {
 	return v
 }
 
-func parsePlatforms(v string) ([]ocispecs.Platform, error) {
-	pl := []ocispecs.Platform{}
-	for _, s := range strings.Split(v, ",") {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		p, err := platforms.Parse(s)
-		if err != nil {
-			return nil, err
-		}
-		p = platforms.Normalize(p)
-		pl = append(pl, p)
-	}
-	return pl, nil
-}
-
 type cf interface {
 	CurrentFrontend() (*llb.State, error)
 }
 
-func Build(ctx context.Context, c client.Client) (*client.Result, error) {
-	opts := c.BuildOpts()
-
-	fn := defaultFilename
-	if f, ok := opts.Opts[keyFilename]; ok {
-		fn = f
+func forwardSingleResult(res *client.Result) (client.Reference, *image.Image, error) {
+	ref, err := res.SingleRef()
+	if err != nil {
+		return nil, nil, err
 	}
 
-	var pl []ocispecs.Platform
-	if v, ok := opts.Opts[keyPlatform]; ok {
-		var err error
-		pl, err = parsePlatforms(v)
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse platforms: %s", v)
+	if dt, ok := res.Metadata[exptypes.ExporterImageConfigKey]; ok {
+		var img image.Image
+		if err := json.Unmarshal(dt, &img); err != nil {
+			return nil, nil, err
 		}
+		return ref, &img, nil
 	}
-	if len(pl) == 0 {
-		pl = append(pl, platforms.Normalize(platforms.DefaultSpec()))
+	return ref, nil, nil
+}
+
+func Build(ctx context.Context, c client.Client) (*client.Result, error) {
+	ui, err := dockerui.NewClient(c)
+	if err != nil {
+		return nil, err
 	}
 
 	var self llb.State
@@ -95,72 +73,47 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 		self = *st
 	}
 
-	if opts.Opts["build-arg:urls"] != "" {
-		if len(pl) != 1 {
-			return nil, errors.Errorf("multiple platforms not supported with urls")
+	src, err := ui.ReadEntrypoint(ctx, "Yaml")
+	if err != nil {
+		return nil, err
+	}
+
+	ic, err := parse(src.Data)
+	if err != nil {
+		return nil, err
+	}
+
+	rb, err := ui.Build(ctx, func(ctx context.Context, platform *ocispecs.Platform, idx int) (client.Reference, *image.Image, error) {
+		if platform == nil {
+			p := platforms.DefaultSpec()
+			platform = &p
 		}
-		return installPkgs(ctx, c, self, pl[0])
-	}
 
-	// TODO: git/http contexts
-	src := llb.Local(localContextName, llb.SessionID(c.BuildOpts().SessionID), llb.SharedKeyHint("alpine-filename"), llb.FollowPaths([]string{fn}))
-	def, err := src.Marshal(ctx)
-	if err != nil {
-		return nil, err
-	}
+		opts := c.BuildOpts().Opts
 
-	res, err := c.Solve(ctx, client.SolveRequest{
-		Definition: def.ToPB(),
-	})
-	if err != nil {
-		return nil, err
-	}
-	dt, err := res.Ref.ReadFile(ctx, client.ReadRequest{
-		Filename: fn,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	ic, err := parse(dt)
-	if err != nil {
-		return nil, err
-	}
-
-	res = client.NewResult()
-	expPlatforms := &exptypes.Platforms{
-		Platforms: make([]exptypes.Platform, len(pl)),
-	}
-
-	eg, ctx := errgroup.WithContext(ctx)
-	for k, p := range pl {
-		k, p := k, p
-		eg.Go(func() error {
-			r, err := buildPlatform(ctx, c, self, p, ic)
+		if urls, ok := opts["build-arg:urls"]; ok && urls != "" {
+			res, img, err := installPkgs(ctx, c, self, *platform)
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
-			pkey := platforms.Format(p)
-			res.AddRef(pkey, r.Ref)
-			expPlatforms.Platforms[k] = exptypes.Platform{
-				ID:       pkey,
-				Platform: p,
+			ref, _, err := forwardSingleResult(res)
+			if err != nil {
+				return nil, nil, err
 			}
-			res.AddMeta(exptypes.ExporterImageConfigKey+"/"+pkey, r.Metadata[exptypes.ExporterImageConfigKey])
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		return nil, err
-	}
+			return ref, img, nil
+		}
 
-	dt, err = json.Marshal(expPlatforms)
+		res, err := buildPlatform(ctx, c, self, *platform, ic)
+		if err != nil {
+			return nil, nil, err
+		}
+		return forwardSingleResult(res)
+	})
 	if err != nil {
 		return nil, err
 	}
-	res.AddMeta(exptypes.ExporterPlatformsKey, dt)
 
-	return res, err
+	return rb.Finalize()
 }
 
 func isIgnoreCache(c client.Client) bool {
@@ -173,7 +126,7 @@ func isIgnoreCache(c client.Client) bool {
 func initRepo(c client.Client, self llb.State, p ocispecs.Platform, repos []string) llb.State {
 	cmd := fmt.Sprintf(`sh -c "apk add --initdb --arch %s --root /out"`, alpinePlatform(p))
 
-	ro := []llb.RunOption{llb.Shlex(cmd), llb.Network(llb.NetModeNone), llb.WithCustomNamef("[%s] initialize repo %s", platforms.Format(p))}
+	ro := []llb.RunOption{llb.Shlex(cmd), llb.Network(llb.NetModeNone), llb.WithCustomNamef("[%s] initialize repo", platforms.Format(p))}
 	if isIgnoreCache(c) {
 		ro = append(ro, llb.IgnoreCache)
 	}
@@ -265,7 +218,7 @@ func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocisp
 	})
 }
 
-func installPkgs(ctx context.Context, c client.Client, self llb.State, p ocispecs.Platform) (*client.Result, error) {
+func installPkgs(ctx context.Context, c client.Client, self llb.State, p ocispecs.Platform) (*client.Result, *image.Image, error) {
 	urls := c.BuildOpts().Opts["build-arg:urls"]
 	repos := c.BuildOpts().Opts["build-arg:repositories"]
 
@@ -283,7 +236,7 @@ func installPkgs(ctx context.Context, c client.Client, self llb.State, p ocispec
 	for _, rawURL := range strings.Split(urls, ",") {
 		u, err := url.Parse(rawURL)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		base := path.Base(u.Path)
 		run.AddMount("/downloads/"+base, llb.HTTP(rawURL, llb.Filename(base), llb.WithCustomNamef("[%s] download %s", platforms.Format(p), base)), llb.SourcePath(base))
@@ -291,19 +244,23 @@ func installPkgs(ctx context.Context, c client.Client, self llb.State, p ocispec
 
 	def, err := rootfs.Marshal(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	res, err := c.Solve(ctx, client.SolveRequest{
 		Definition: def.ToPB(),
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	img := ocispecs.Image{
-		Architecture: p.Architecture,
-		OS:           p.OS,
-		Variant:      p.Variant,
+	img := &image.Image{
+		Image: ocispecs.Image{
+			Platform: ocispecs.Platform{
+				Architecture: p.Architecture,
+				OS:           p.OS,
+				Variant:      p.Variant,
+			},
+		},
 	}
 	for k, v := range c.BuildOpts().Opts {
 		if !strings.HasPrefix(k, "build-arg:") {
@@ -322,21 +279,15 @@ func installPkgs(ctx context.Context, c client.Client, self llb.State, p ocispec
 			img.Config.Env = append(img.Config.Env, strings.TrimPrefix(k, "build-arg:env:")+"="+v)
 		}
 	}
-	dt, err := json.Marshal(img)
-	if err != nil {
-		return nil, err
-	}
 
-	res.AddMeta(exptypes.ExporterImageConfigKey, dt)
-
-	return res, nil
+	return res, img, nil
 }
 
 func parse(dt []byte) (*apko.ImageConfiguration, error) {
 	// TODO: apko doesn't have a clean types pkg. Upstream changes or copy/paste only the definitions
 	var ic apko.ImageConfiguration
 	if err := yaml.Unmarshal(dt, &ic); err != nil {
-		return nil, errors.Errorf("failed to parse image configuration: %w", err)
+		return nil, errors.Wrap(err, "failed to parse image configuration")
 	}
 	if err := ic.Validate(); err != nil {
 		return nil, err

@@ -13,6 +13,7 @@ import (
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/solver/pb"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
@@ -244,10 +245,23 @@ func buildPlatform(ctx context.Context, c client.Client, self llb.State, p ocisp
 		opts["build-arg:env:"+k] = v
 	}
 
+	inputs, err := c.Inputs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	frontendInputs := make(map[string]*pb.Definition)
+	for name, state := range inputs {
+		def, err := state.Marshal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		frontendInputs[name] = def.ToPB()
+	}
+
 	return c.Solve(ctx, client.SolveRequest{
-		Frontend:    "gateway.v0",
-		FrontendOpt: opts,
-		// FrontendInputs
+		Frontend:       "gateway.v0",
+		FrontendOpt:    opts,
+		FrontendInputs: frontendInputs,
 	})
 }
 
